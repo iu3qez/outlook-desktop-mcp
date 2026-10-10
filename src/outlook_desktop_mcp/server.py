@@ -55,6 +55,7 @@ from outlook_desktop_mcp.utils.formatting import (
     format_task_full,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
+from outlook_desktop_mcp.utils.dates import restrict_date
 
 # --- Logging (all to stderr, stdout is reserved for MCP JSON-RPC) ---
 
@@ -368,13 +369,13 @@ async def list_emails(
             restrictions.append("[UnRead] = True")
         if start_date:
             start = _parse_date(start_date)
-            restrictions.append(f"[ReceivedTime] >= '{start.strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] >= '{restrict_date(start)}'")
         if end_date:
             end = _parse_date(end_date)
-            restrictions.append(f"[ReceivedTime] <= '{end.strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] <= '{restrict_date(end)}'")
         elif start_date:
             # Default end to now when start is specified
-            restrictions.append(f"[ReceivedTime] <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] <= '{restrict_date(datetime.now())}'")
 
         if restrictions:
             items = items.Restrict(" AND ".join(restrictions))
@@ -758,16 +759,16 @@ async def search_emails(
         if start_date:
             start = _parse_date(start_date)
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" >= '{start.strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" >= '{restrict_date(start, utc=True)}'"
             )
         if end_date:
             end = _parse_date(end_date)
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" <= '{restrict_date(end, utc=True)}'"
             )
         elif start_date:
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" <= '{restrict_date(datetime.now(), utc=True)}'"
             )
 
         filter_str = "@SQL=" + " AND ".join(dasl_parts)
@@ -847,8 +848,8 @@ async def list_events(
         end = _parse_date(end_date) if end_date else start + timedelta(days=7)
 
         restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+            f"[Start] >= '{restrict_date(start)}' "
+            f"AND [Start] <= '{restrict_date(end)}'"
         )
         filtered = items.Restrict(restrict)
 
@@ -1284,8 +1285,8 @@ async def search_events(
         end = _parse_date(end_date) if end_date else datetime.now() + timedelta(days=30)
 
         restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+            f"[Start] >= '{restrict_date(start)}' "
+            f"AND [Start] <= '{restrict_date(end)}'"
         )
         filtered = items.Restrict(restrict)
 
