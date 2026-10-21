@@ -2317,6 +2317,169 @@ async def toggle_rule(
         return f"Error toggling rule: {format_com_error(e)}"
 
 
+_OL_RULE_RECEIVE = 0
+_OL_RULE_EXECUTE_ALL_MESSAGES = 0
+_OL_FOLDER_INBOX = 6
+
+
+def _split_terms(value: str) -> list[str]:
+    """Split a comma-separated parameter into a list of non-empty terms."""
+    return [t.strip() for t in value.split(",") if t.strip()]
+
+
+@mcp.tool()
+async def create_rule(
+    name: str,
+    sender_contains: str = "",
+    subject_contains: str = "",
+    body_or_subject_contains: str = "",
+    has_attachment: bool = False,
+    except_subject_contains: str = "",
+    move_to_folder: str = "",
+    copy_to_folder: str = "",
+    assign_categories: str = "",
+    delete: bool = False,
+    stop_processing: bool = False,
+    enabled: bool = True,
+    run_now: bool = False,
+    account: str = "",
+) -> str:
+    """Create a new incoming-mail rule.
+
+    All given conditions must match (AND); multiple comma-separated terms
+    within one condition match if ANY term matches (OR). At least one
+    condition and one action are required. The Outlook object model cannot
+    create every rule the Rules wizard can — e.g. "mark as read" is not
+    available programmatically.
+
+    CAUTION: This modifies live mail rules immediately. Check list_rules
+    first — rule names are not unique, so a duplicate name creates a second
+    rule rather than replacing the existing one.
+
+    Args:
+        name: Rule name shown in Outlook's Rules and Alerts.
+        sender_contains: Comma-separated text matched against the sender's
+            address (e.g. "@newsletter.com, noreply@").
+        subject_contains: Comma-separated words/phrases in the subject.
+        body_or_subject_contains: Comma-separated words/phrases in subject or body.
+        has_attachment: If true, only messages with attachments match.
+        except_subject_contains: Comma-separated subject terms that EXCLUDE
+            a message from the rule.
+        move_to_folder: Action. Folder name or slash path to move matches to.
+        copy_to_folder: Action. Folder name or slash path to copy matches to.
+        assign_categories: Action. Comma-separated category names to assign.
+        delete: Action. Move matches to Deleted Items.
+        stop_processing: Action. Stop processing further rules after this one.
+        enabled: Whether the rule is active after creation. Default true.
+        run_now: If true, also apply the rule once to messages already in
+            the Inbox (not subfolders).
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        JSON object describing the created rule, or an error.
+    """
+    def _create(outlook, namespace, name, sender_contains, subject_contains,
+                body_or_subject_contains, has_attachment, except_subject_contains,
+                move_to_folder, copy_to_folder, assign_categories, delete,
+                stop_processing, enabled, run_now, account):
+        senders = _split_terms(sender_contains)
+        subjects = _split_terms(subject_contains)
+        body_terms = _split_terms(body_or_subject_contains)
+        except_subjects = _split_terms(except_subject_contains)
+        categories = _split_terms(assign_categories)
+
+        if not (senders or subjects or body_terms or has_attachment):
+            return json.dumps({"error": "At least one condition is required"})
+        if not (move_to_folder or copy_to_folder or categories or delete):
+            return json.dumps({"error": "At least one action is required (move, copy, categories or delete)"})
+        if move_to_folder and delete:
+            return json.dumps({"error": "move_to_folder and delete are mutually exclusive"})
+
+        store = _require_store(namespace, account)
+        move_dest = copy_dest = None
+        if move_to_folder:
+            move_dest = _resolve_folder(namespace, move_to_folder, store)
+            if not move_dest:
+                return json.dumps({"error": f"Folder '{move_to_folder}' not found"})
+        if copy_to_folder:
+            copy_dest = _resolve_folder(namespace, copy_to_folder, store)
+            if not copy_dest:
+                return json.dumps({"error": f"Folder '{copy_to_folder}' not found"})
+
+        rules = store.GetRules()
+        rule = rules.Create(name, _OL_RULE_RECEIVE)
+
+        cond = rule.Conditions
+        if senders:
+            cond.SenderAddress.Address = senders
+            cond.SenderAddress.Enabled = True
+        if subjects:
+            cond.Subject.Text = subjects
+            cond.Subject.Enabled = True
+        if body_terms:
+            cond.BodyOrSubject.Text = body_terms
+            cond.BodyOrSubject.Enabled = True
+        if has_attachment:
+            cond.HasAttachment.Enabled = True
+        if except_subjects:
+            rule.Exceptions.Subject.Text = except_subjects
+            rule.Exceptions.Subject.Enabled = True
+
+        actions = rule.Actions
+        if move_dest is not None:
+            actions.MoveToFolder.Folder = move_dest
+            actions.MoveToFolder.Enabled = True
+        if copy_dest is not None:
+            actions.CopyToFolder.Folder = copy_dest
+            actions.CopyToFolder.Enabled = True
+        if categories:
+            actions.AssignToCategory.Categories = categories
+            actions.AssignToCategory.Enabled = True
+        if delete:
+            actions.Delete.Enabled = True
+        if stop_processing:
+            actions.Stop.Enabled = True
+
+        rule.Enabled = enabled
+        logger.warning("create_rule: creating rule '%s' (enabled=%s)", name, enabled)
+        rules.Save()
+
+        if run_now:
+            rule.Execute(False, store.GetDefaultFolder(_OL_FOLDER_INBOX), False,
+                         _OL_RULE_EXECUTE_ALL_MESSAGES)
+
+        return json.dumps({
+            "status": "created",
+            "name": name,
+            "enabled": enabled,
+            "conditions": {
+                "sender_contains": senders,
+                "subject_contains": subjects,
+                "body_or_subject_contains": body_terms,
+                "has_attachment": has_attachment,
+            },
+            "exceptions": {"subject_contains": except_subjects},
+            "actions": {
+                "move_to_folder": move_to_folder or None,
+                "copy_to_folder": copy_to_folder or None,
+                "assign_categories": categories,
+                "delete": delete,
+                "stop_processing": stop_processing,
+            },
+            "executed_on_inbox": run_now,
+        }, indent=2)
+
+    try:
+        return await bridge.call(_create, name, sender_contains, subject_contains,
+                                 body_or_subject_contains, has_attachment,
+                                 except_subject_contains, move_to_folder,
+                                 copy_to_folder, assign_categories, delete,
+                                 stop_processing, enabled, run_now, account)
+    except Exception as e:
+        return f"Error creating rule: {format_com_error(e)}"
+
+
 # =====================================================================
 # OUT OF OFFICE TOOLS
 # =====================================================================
