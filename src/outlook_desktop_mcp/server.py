@@ -890,6 +890,114 @@ async def move_email(
 
 
 # =====================================================================
+# TOOL 6B: move_by_filter
+# =====================================================================
+
+@mcp.tool()
+async def move_by_filter(
+    folder: str,
+    dasl: str,
+    target_folder: str,
+    dry_run: bool = True,
+    max_items: int = 500,
+    account: str = "",
+    target_account: str = "",
+) -> str:
+    """Move every item in a folder that matches a DASL filter, in bulk.
+
+    Runs Items.Restrict with the given DASL condition on the source folder
+    and moves all matches to target_folder. Defaults to dry_run=True, which
+    only reports what would be moved — call again with dry_run=False to
+    actually move. Use search_emails with the same `filter` to preview
+    individual messages first.
+
+    CAUTION: With dry_run=False this moves messages immediately and every
+    moved item gets a NEW entry_id.
+
+    Args:
+        folder: Source folder (same names as list_emails, e.g. "inbox",
+            "Inbox/Newsletters").
+        dasl: DASL condition passed to Items.Restrict as-is ("@SQL=" prefix
+            optional). Example: "urn:schemas:httpmail:fromemail" LIKE '%@example.com'
+        target_folder: Destination folder name or slash path.
+        dry_run: If true (default), only count and sample the matches.
+        max_items: Maximum number of items to move in one call. Default 500,
+            capped at 5000. Call again to process the rest.
+        account: Optional. Account holding the source folder. Default: primary.
+        target_account: Optional. Account holding the target folder.
+            Default: same as account.
+
+    Returns:
+        JSON object with matched/moved counts and a sample of subjects.
+    """
+    def _move_all(outlook, namespace, folder, dasl, target_folder, dry_run,
+                  max_items, account, target_account):
+        max_items = min(max(1, max_items), 5000)
+        condition = _raw_dasl(dasl)
+        if not condition:
+            return json.dumps({"error": "dasl filter is required"})
+
+        store = _require_store(namespace, account)
+        source = _resolve_folder(namespace, folder, store)
+        if not source:
+            return json.dumps({"error": f"Folder '{folder}' not found"})
+        dest_store = _require_store(namespace, target_account or account)
+        dest = _resolve_folder(namespace, target_folder, dest_store)
+        if not dest:
+            return json.dumps({"error": f"Target folder '{target_folder}' not found. Use list_folders to see available folders."})
+        if dest.EntryID == source.EntryID:
+            return json.dumps({"error": "Source and target folder are the same"})
+
+        matches = source.Items.Restrict("@SQL=" + condition)
+        matched = matches.Count
+        # Snapshot the items before moving: moving shrinks the restricted
+        # collection and would make index-based iteration skip items.
+        batch = [matches.Item(i + 1) for i in range(min(matched, max_items))]
+
+        sample = []
+        for item in batch[:20]:
+            try:
+                sample.append(item.Subject)
+            except Exception:
+                continue
+
+        result = {
+            "dry_run": dry_run,
+            "folder": folder,
+            "target_folder": target_folder,
+            "matched": matched,
+            "sample_subjects": sample,
+        }
+        if dry_run:
+            result["would_move"] = len(batch)
+            return json.dumps(result, indent=2, default=str)
+
+        logger.warning(
+            "move_by_filter: moving %d items from '%s' to '%s'",
+            len(batch), folder, target_folder,
+        )
+        moved, errors = 0, []
+        for item in batch:
+            try:
+                item.Move(dest)
+                moved += 1
+            except Exception as e:
+                if len(errors) < 10:
+                    errors.append(format_com_error(e))
+        result["moved"] = moved
+        result["remaining"] = matched - moved
+        if errors:
+            result["errors"] = errors
+        return json.dumps(result, indent=2, default=str)
+
+    try:
+        return await bridge.call(_move_all, folder, dasl, target_folder, dry_run,
+                                 max_items, account, target_account)
+    except Exception as e:
+        return f"Error moving emails by filter: {format_com_error(e)}"
+
+
+# =====================================================================
 # TOOL 7: reply_email
 # =====================================================================
 
