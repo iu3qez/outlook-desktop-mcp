@@ -78,6 +78,17 @@ def _safe_dasl(query: str) -> str:
     return query.replace("'", "''").replace('"', '""')
 
 
+def _raw_dasl(filter_str: str) -> str:
+    """Normalize a caller-supplied DASL condition so it can be AND-ed with
+    other conditions: strips an optional leading "@SQL=" and wraps it in
+    parentheses. The condition is passed to Restrict verbatim — it is not
+    sanitized, so the caller owns its syntax."""
+    filter_str = filter_str.strip()
+    if filter_str[:5].upper() == "@SQL=":
+        filter_str = filter_str[5:].strip()
+    return f"({filter_str})" if filter_str else ""
+
+
 # Outlook item Class constants (olObjectClass — distinct from olItemType used in CreateItem)
 _OL_CLASS_MAIL = 43
 _OL_CLASS_APPOINTMENT = 26
@@ -1011,22 +1022,25 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
 
 @mcp.tool()
 async def search_emails(
-    query: str,
+    query: str = "",
     folder: str = "inbox",
     count: int = 10,
     start_date: str = "",
     end_date: str = "",
     account: str = "",
+    sender: str = "",
+    filter: str = "",
 ) -> str:
-    """Search for emails in Outlook using text search.
+    """Search for emails in Outlook using text, sender and/or a raw DASL filter.
 
     Searches email subjects and bodies using Outlook's DASL filter.
-    Results are sorted by received time (newest first). Each result
-    includes entry_id for further operations.
+    All given criteria are combined with AND; at least one of query,
+    sender, filter or a date is required. Results are sorted by received
+    time (newest first). Each result includes entry_id for further operations.
 
     Args:
-        query: The search term (case-insensitive substring match).
-            Examples: "budget report", "meeting notes", "quarterly".
+        query: Optional. The search term (case-insensitive substring match
+            on subject and body). Examples: "budget report", "quarterly".
         folder: Folder to search in. Default "inbox". Supports same
             names as list_emails.
         count: Maximum results to return. Default 10.
@@ -1036,22 +1050,42 @@ async def search_emails(
             ISO 8601 format. Default: now (if start_date is provided).
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        sender: Optional. Substring matched against the sender's email
+            address or display name (e.g. "newsletter@", "Mario Rossi").
+        filter: Optional. Raw DASL condition passed to Items.Restrict as-is
+            (the "@SQL=" prefix is optional), for anything the other
+            parameters don't cover. Example:
+            "urn:schemas:httpmail:fromemail" LIKE '%@example.com'
+            AND "urn:schemas:httpmail:hasattachment" = 1
 
     Returns:
         JSON array of matching email summaries, or an error.
     """
-    def _search(outlook, namespace, query, folder, count, start_date, end_date, account):
+    def _search(outlook, namespace, query, folder, count, start_date, end_date,
+                account, sender, filter):
         count = min(max(1, count), 200)
+        if not (query or sender or filter.strip() or start_date or end_date):
+            return json.dumps({"error": "Provide at least one of query, sender, filter, start_date or end_date"})
         store = _require_store(namespace, account)
         target = _resolve_folder(namespace, folder, store)
         if not target:
             return json.dumps({"error": f"Folder '{folder}' not found"})
 
-        safe_query = _safe_dasl(query)
-        dasl_parts = [
-            f"(\"urn:schemas:httpmail:subject\" LIKE '%{safe_query}%' OR "
-            f"\"urn:schemas:httpmail:textdescription\" LIKE '%{safe_query}%')"
-        ]
+        dasl_parts = []
+        if query:
+            safe_query = _safe_dasl(query)
+            dasl_parts.append(
+                f"(\"urn:schemas:httpmail:subject\" LIKE '%{safe_query}%' OR "
+                f"\"urn:schemas:httpmail:textdescription\" LIKE '%{safe_query}%')"
+            )
+        if sender:
+            safe_sender = _safe_dasl(sender)
+            dasl_parts.append(
+                f"(\"urn:schemas:httpmail:fromemail\" LIKE '%{safe_sender}%' OR "
+                f"\"urn:schemas:httpmail:fromname\" LIKE '%{safe_sender}%')"
+            )
+        if raw := _raw_dasl(filter):
+            dasl_parts.append(raw)
         if start_date:
             start = _parse_date(start_date)
             dasl_parts.append(
@@ -1081,7 +1115,8 @@ async def search_emails(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_search, query, folder, count, start_date, end_date, account)
+        return await bridge.call(_search, query, folder, count, start_date, end_date,
+                                 account, sender, filter)
     except Exception as e:
         return f"Error searching emails: {format_com_error(e)}"
 
