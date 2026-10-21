@@ -78,6 +78,17 @@ def _safe_dasl(query: str) -> str:
     return query.replace("'", "''").replace('"', '""')
 
 
+def _raw_dasl(filter_str: str) -> str:
+    """Normalize a caller-supplied DASL condition so it can be AND-ed with
+    other conditions: strips an optional leading "@SQL=" and wraps it in
+    parentheses. The condition is passed to Restrict verbatim — it is not
+    sanitized, so the caller owns its syntax."""
+    filter_str = filter_str.strip()
+    if filter_str[:5].upper() == "@SQL=":
+        filter_str = filter_str[5:].strip()
+    return f"({filter_str})" if filter_str else ""
+
+
 # Outlook item Class constants (olObjectClass — distinct from olItemType used in CreateItem)
 _OL_CLASS_MAIL = 43
 _OL_CLASS_APPOINTMENT = 26
@@ -112,7 +123,7 @@ mcp = FastMCP(
         "respond to invites, search events\n"
         "- Tasks: create, list, complete, update, delete to-do items\n"
         "- Categories: list and set color categories on any item\n"
-        "- Rules: list and manage mail rules\n"
+        "- Rules: list, create and enable/disable mail rules\n"
         "- Out of Office: check auto-reply status\n"
         "- Folders: list folder hierarchy with item counts"
     ),
@@ -879,6 +890,114 @@ async def move_email(
 
 
 # =====================================================================
+# TOOL 6B: move_by_filter
+# =====================================================================
+
+@mcp.tool()
+async def move_by_filter(
+    folder: str,
+    dasl: str,
+    target_folder: str,
+    dry_run: bool = True,
+    max_items: int = 500,
+    account: str = "",
+    target_account: str = "",
+) -> str:
+    """Move every item in a folder that matches a DASL filter, in bulk.
+
+    Runs Items.Restrict with the given DASL condition on the source folder
+    and moves all matches to target_folder. Defaults to dry_run=True, which
+    only reports what would be moved — call again with dry_run=False to
+    actually move. Use search_emails with the same `filter` to preview
+    individual messages first.
+
+    CAUTION: With dry_run=False this moves messages immediately and every
+    moved item gets a NEW entry_id.
+
+    Args:
+        folder: Source folder (same names as list_emails, e.g. "inbox",
+            "Inbox/Newsletters").
+        dasl: DASL condition passed to Items.Restrict as-is ("@SQL=" prefix
+            optional). Example: "urn:schemas:httpmail:fromemail" LIKE '%@example.com'
+        target_folder: Destination folder name or slash path.
+        dry_run: If true (default), only count and sample the matches.
+        max_items: Maximum number of items to move in one call. Default 500,
+            capped at 5000. Call again to process the rest.
+        account: Optional. Account holding the source folder. Default: primary.
+        target_account: Optional. Account holding the target folder.
+            Default: same as account.
+
+    Returns:
+        JSON object with matched/moved counts and a sample of subjects.
+    """
+    def _move_all(outlook, namespace, folder, dasl, target_folder, dry_run,
+                  max_items, account, target_account):
+        max_items = min(max(1, max_items), 5000)
+        condition = _raw_dasl(dasl)
+        if not condition:
+            return json.dumps({"error": "dasl filter is required"})
+
+        store = _require_store(namespace, account)
+        source = _resolve_folder(namespace, folder, store)
+        if not source:
+            return json.dumps({"error": f"Folder '{folder}' not found"})
+        dest_store = _require_store(namespace, target_account or account)
+        dest = _resolve_folder(namespace, target_folder, dest_store)
+        if not dest:
+            return json.dumps({"error": f"Target folder '{target_folder}' not found. Use list_folders to see available folders."})
+        if dest.EntryID == source.EntryID:
+            return json.dumps({"error": "Source and target folder are the same"})
+
+        matches = source.Items.Restrict("@SQL=" + condition)
+        matched = matches.Count
+        # Snapshot the items before moving: moving shrinks the restricted
+        # collection and would make index-based iteration skip items.
+        batch = [matches.Item(i + 1) for i in range(min(matched, max_items))]
+
+        sample = []
+        for item in batch[:20]:
+            try:
+                sample.append(item.Subject)
+            except Exception:
+                continue
+
+        result = {
+            "dry_run": dry_run,
+            "folder": folder,
+            "target_folder": target_folder,
+            "matched": matched,
+            "sample_subjects": sample,
+        }
+        if dry_run:
+            result["would_move"] = len(batch)
+            return json.dumps(result, indent=2, default=str)
+
+        logger.warning(
+            "move_by_filter: moving %d items from '%s' to '%s'",
+            len(batch), folder, target_folder,
+        )
+        moved, errors = 0, []
+        for item in batch:
+            try:
+                item.Move(dest)
+                moved += 1
+            except Exception as e:
+                if len(errors) < 10:
+                    errors.append(format_com_error(e))
+        result["moved"] = moved
+        result["remaining"] = matched - moved
+        if errors:
+            result["errors"] = errors
+        return json.dumps(result, indent=2, default=str)
+
+    try:
+        return await bridge.call(_move_all, folder, dasl, target_folder, dry_run,
+                                 max_items, account, target_account)
+    except Exception as e:
+        return f"Error moving emails by filter: {format_com_error(e)}"
+
+
+# =====================================================================
 # TOOL 7: reply_email
 # =====================================================================
 
@@ -1011,22 +1130,25 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
 
 @mcp.tool()
 async def search_emails(
-    query: str,
+    query: str = "",
     folder: str = "inbox",
     count: int = 10,
     start_date: str = "",
     end_date: str = "",
     account: str = "",
+    sender: str = "",
+    filter: str = "",
 ) -> str:
-    """Search for emails in Outlook using text search.
+    """Search for emails in Outlook using text, sender and/or a raw DASL filter.
 
     Searches email subjects and bodies using Outlook's DASL filter.
-    Results are sorted by received time (newest first). Each result
-    includes entry_id for further operations.
+    All given criteria are combined with AND; at least one of query,
+    sender, filter or a date is required. Results are sorted by received
+    time (newest first). Each result includes entry_id for further operations.
 
     Args:
-        query: The search term (case-insensitive substring match).
-            Examples: "budget report", "meeting notes", "quarterly".
+        query: Optional. The search term (case-insensitive substring match
+            on subject and body). Examples: "budget report", "quarterly".
         folder: Folder to search in. Default "inbox". Supports same
             names as list_emails.
         count: Maximum results to return. Default 10.
@@ -1036,22 +1158,42 @@ async def search_emails(
             ISO 8601 format. Default: now (if start_date is provided).
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        sender: Optional. Substring matched against the sender's email
+            address or display name (e.g. "newsletter@", "Mario Rossi").
+        filter: Optional. Raw DASL condition passed to Items.Restrict as-is
+            (the "@SQL=" prefix is optional), for anything the other
+            parameters don't cover. Example:
+            "urn:schemas:httpmail:fromemail" LIKE '%@example.com'
+            AND "urn:schemas:httpmail:hasattachment" = 1
 
     Returns:
         JSON array of matching email summaries, or an error.
     """
-    def _search(outlook, namespace, query, folder, count, start_date, end_date, account):
+    def _search(outlook, namespace, query, folder, count, start_date, end_date,
+                account, sender, filter):
         count = min(max(1, count), 200)
+        if not (query or sender or filter.strip() or start_date or end_date):
+            return json.dumps({"error": "Provide at least one of query, sender, filter, start_date or end_date"})
         store = _require_store(namespace, account)
         target = _resolve_folder(namespace, folder, store)
         if not target:
             return json.dumps({"error": f"Folder '{folder}' not found"})
 
-        safe_query = _safe_dasl(query)
-        dasl_parts = [
-            f"(\"urn:schemas:httpmail:subject\" LIKE '%{safe_query}%' OR "
-            f"\"urn:schemas:httpmail:textdescription\" LIKE '%{safe_query}%')"
-        ]
+        dasl_parts = []
+        if query:
+            safe_query = _safe_dasl(query)
+            dasl_parts.append(
+                f"(\"urn:schemas:httpmail:subject\" LIKE '%{safe_query}%' OR "
+                f"\"urn:schemas:httpmail:textdescription\" LIKE '%{safe_query}%')"
+            )
+        if sender:
+            safe_sender = _safe_dasl(sender)
+            dasl_parts.append(
+                f"(\"urn:schemas:httpmail:fromemail\" LIKE '%{safe_sender}%' OR "
+                f"\"urn:schemas:httpmail:fromname\" LIKE '%{safe_sender}%')"
+            )
+        if raw := _raw_dasl(filter):
+            dasl_parts.append(raw)
         if start_date:
             start = _parse_date(start_date)
             dasl_parts.append(
@@ -1081,7 +1223,8 @@ async def search_emails(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_search, query, folder, count, start_date, end_date, account)
+        return await bridge.call(_search, query, folder, count, start_date, end_date,
+                                 account, sender, filter)
     except Exception as e:
         return f"Error searching emails: {format_com_error(e)}"
 
@@ -2172,6 +2315,169 @@ async def toggle_rule(
         return await bridge.call(_toggle, rule_name, enabled, account)
     except Exception as e:
         return f"Error toggling rule: {format_com_error(e)}"
+
+
+_OL_RULE_RECEIVE = 0
+_OL_RULE_EXECUTE_ALL_MESSAGES = 0
+_OL_FOLDER_INBOX = 6
+
+
+def _split_terms(value: str) -> list[str]:
+    """Split a comma-separated parameter into a list of non-empty terms."""
+    return [t.strip() for t in value.split(",") if t.strip()]
+
+
+@mcp.tool()
+async def create_rule(
+    name: str,
+    sender_contains: str = "",
+    subject_contains: str = "",
+    body_or_subject_contains: str = "",
+    has_attachment: bool = False,
+    except_subject_contains: str = "",
+    move_to_folder: str = "",
+    copy_to_folder: str = "",
+    assign_categories: str = "",
+    delete: bool = False,
+    stop_processing: bool = False,
+    enabled: bool = True,
+    run_now: bool = False,
+    account: str = "",
+) -> str:
+    """Create a new incoming-mail rule.
+
+    All given conditions must match (AND); multiple comma-separated terms
+    within one condition match if ANY term matches (OR). At least one
+    condition and one action are required. The Outlook object model cannot
+    create every rule the Rules wizard can — e.g. "mark as read" is not
+    available programmatically.
+
+    CAUTION: This modifies live mail rules immediately. Check list_rules
+    first — rule names are not unique, so a duplicate name creates a second
+    rule rather than replacing the existing one.
+
+    Args:
+        name: Rule name shown in Outlook's Rules and Alerts.
+        sender_contains: Comma-separated text matched against the sender's
+            address (e.g. "@newsletter.com, noreply@").
+        subject_contains: Comma-separated words/phrases in the subject.
+        body_or_subject_contains: Comma-separated words/phrases in subject or body.
+        has_attachment: If true, only messages with attachments match.
+        except_subject_contains: Comma-separated subject terms that EXCLUDE
+            a message from the rule.
+        move_to_folder: Action. Folder name or slash path to move matches to.
+        copy_to_folder: Action. Folder name or slash path to copy matches to.
+        assign_categories: Action. Comma-separated category names to assign.
+        delete: Action. Move matches to Deleted Items.
+        stop_processing: Action. Stop processing further rules after this one.
+        enabled: Whether the rule is active after creation. Default true.
+        run_now: If true, also apply the rule once to messages already in
+            the Inbox (not subfolders).
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        JSON object describing the created rule, or an error.
+    """
+    def _create(outlook, namespace, name, sender_contains, subject_contains,
+                body_or_subject_contains, has_attachment, except_subject_contains,
+                move_to_folder, copy_to_folder, assign_categories, delete,
+                stop_processing, enabled, run_now, account):
+        senders = _split_terms(sender_contains)
+        subjects = _split_terms(subject_contains)
+        body_terms = _split_terms(body_or_subject_contains)
+        except_subjects = _split_terms(except_subject_contains)
+        categories = _split_terms(assign_categories)
+
+        if not (senders or subjects or body_terms or has_attachment):
+            return json.dumps({"error": "At least one condition is required"})
+        if not (move_to_folder or copy_to_folder or categories or delete):
+            return json.dumps({"error": "At least one action is required (move, copy, categories or delete)"})
+        if move_to_folder and delete:
+            return json.dumps({"error": "move_to_folder and delete are mutually exclusive"})
+
+        store = _require_store(namespace, account)
+        move_dest = copy_dest = None
+        if move_to_folder:
+            move_dest = _resolve_folder(namespace, move_to_folder, store)
+            if not move_dest:
+                return json.dumps({"error": f"Folder '{move_to_folder}' not found"})
+        if copy_to_folder:
+            copy_dest = _resolve_folder(namespace, copy_to_folder, store)
+            if not copy_dest:
+                return json.dumps({"error": f"Folder '{copy_to_folder}' not found"})
+
+        rules = store.GetRules()
+        rule = rules.Create(name, _OL_RULE_RECEIVE)
+
+        cond = rule.Conditions
+        if senders:
+            cond.SenderAddress.Address = senders
+            cond.SenderAddress.Enabled = True
+        if subjects:
+            cond.Subject.Text = subjects
+            cond.Subject.Enabled = True
+        if body_terms:
+            cond.BodyOrSubject.Text = body_terms
+            cond.BodyOrSubject.Enabled = True
+        if has_attachment:
+            cond.HasAttachment.Enabled = True
+        if except_subjects:
+            rule.Exceptions.Subject.Text = except_subjects
+            rule.Exceptions.Subject.Enabled = True
+
+        actions = rule.Actions
+        if move_dest is not None:
+            actions.MoveToFolder.Folder = move_dest
+            actions.MoveToFolder.Enabled = True
+        if copy_dest is not None:
+            actions.CopyToFolder.Folder = copy_dest
+            actions.CopyToFolder.Enabled = True
+        if categories:
+            actions.AssignToCategory.Categories = categories
+            actions.AssignToCategory.Enabled = True
+        if delete:
+            actions.Delete.Enabled = True
+        if stop_processing:
+            actions.Stop.Enabled = True
+
+        rule.Enabled = enabled
+        logger.warning("create_rule: creating rule '%s' (enabled=%s)", name, enabled)
+        rules.Save()
+
+        if run_now:
+            rule.Execute(False, store.GetDefaultFolder(_OL_FOLDER_INBOX), False,
+                         _OL_RULE_EXECUTE_ALL_MESSAGES)
+
+        return json.dumps({
+            "status": "created",
+            "name": name,
+            "enabled": enabled,
+            "conditions": {
+                "sender_contains": senders,
+                "subject_contains": subjects,
+                "body_or_subject_contains": body_terms,
+                "has_attachment": has_attachment,
+            },
+            "exceptions": {"subject_contains": except_subjects},
+            "actions": {
+                "move_to_folder": move_to_folder or None,
+                "copy_to_folder": copy_to_folder or None,
+                "assign_categories": categories,
+                "delete": delete,
+                "stop_processing": stop_processing,
+            },
+            "executed_on_inbox": run_now,
+        }, indent=2)
+
+    try:
+        return await bridge.call(_create, name, sender_contains, subject_contains,
+                                 body_or_subject_contains, has_attachment,
+                                 except_subject_contains, move_to_folder,
+                                 copy_to_folder, assign_categories, delete,
+                                 stop_processing, enabled, run_now, account)
+    except Exception as e:
+        return f"Error creating rule: {format_com_error(e)}"
 
 
 # =====================================================================
