@@ -123,7 +123,7 @@ mcp = FastMCP(
         "respond to invites, search events\n"
         "- Tasks: create, list, complete, update, delete to-do items\n"
         "- Categories: list and set color categories on any item\n"
-        "- Rules: list and manage mail rules\n"
+        "- Rules: list, create and enable/disable mail rules\n"
         "- Out of Office: check auto-reply status\n"
         "- Folders: list folder hierarchy with item counts"
     ),
