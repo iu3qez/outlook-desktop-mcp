@@ -12,6 +12,15 @@ import json
 import logging
 import re
 
+# When launched via `python -m outlook_desktop_mcp.server`, runpy loads this
+# file as sys.modules["__main__"] but NOT as sys.modules["outlook_desktop_mcp.server"].
+# Without this alias, tool modules that later do `from outlook_desktop_mcp
+# import server` re-execute this file, creating a second `bridge = OutlookBridge()`
+# distinct from the one main() actually started — every tool call then times
+# out because no COM thread services the duplicate bridge's queue.
+if __name__ == "__main__":
+    sys.modules["outlook_desktop_mcp.server"] = sys.modules["__main__"]
+
 from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.com_bridge import OutlookBridge
@@ -46,6 +55,7 @@ from outlook_desktop_mcp.utils.formatting import (
     format_task_full,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
+from outlook_desktop_mcp.utils.dates import restrict_date
 
 # --- Logging (all to stderr, stdout is reserved for MCP JSON-RPC) ---
 
@@ -143,7 +153,13 @@ def _require_store(namespace, account: str = ""):
 
 def _walk_folders(parent, name_lower: str):
     """Recursively search subfolders of parent for a folder matching name_lower."""
-    for i in range(parent.Folders.Count):
+    try:
+        # Some Exchange/shared-mailbox folder types raise COMError on .Count;
+        # treat them as empty to avoid crashing the traversal.
+        count = parent.Folders.Count
+    except Exception:
+        return None
+    for i in range(count):
         try:
             f = parent.Folders.Item(i + 1)
             if f.Name.lower() == name_lower:
@@ -164,6 +180,7 @@ def _resolve_folder(namespace, folder_name: str, store=None):
     2. Built-in Outlook folder enum (inbox, sent, deleted, etc.)
     3. Root-level folder name match (fast path)
     4. Recursive depth-first search of entire folder tree (fallback)
+    5. Search folders (virtual/search folders not in regular tree)
     """
     folder_name = folder_name.strip()
     store = store or namespace.DefaultStore
@@ -177,7 +194,11 @@ def _resolve_folder(namespace, folder_name: str, store=None):
         for part in parts[1:]:
             part_lower = part.lower()
             found = None
-            for i in range(current.Folders.Count):
+            try:
+                count = current.Folders.Count
+            except Exception:
+                return None
+            for i in range(count):
                 try:
                     f = current.Folders.Item(i + 1)
                     if f.Name.lower() == part_lower:
@@ -207,7 +228,25 @@ def _resolve_folder(namespace, folder_name: str, store=None):
             continue
 
     # Recursive fallback: search entire folder tree
-    return _walk_folders(root, folder_lower)
+    result = _walk_folders(root, folder_lower)
+    if result:
+        return result
+
+    # Search folders fallback: virtual folders (e.g. "Flagged", "To-Do") are
+    # not in the regular folder tree — access via Store.GetSearchFolders()
+    try:
+        search_folders = store.GetSearchFolders()
+        for i in range(search_folders.Count):
+            try:
+                f = search_folders.Item(i + 1)
+                if f.Name.lower() == folder_lower:
+                    return f
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
 
 
 # =====================================================================
@@ -305,6 +344,273 @@ async def send_email(
 
 
 # =====================================================================
+# TOOL 1B: save_draft
+# =====================================================================
+
+@mcp.tool()
+async def save_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    account: str = "",
+) -> str:
+    """Save an email as a draft in Outlook's Drafts folder without sending.
+
+    Creates an email and stores it in the Drafts folder of the selected account
+    so the user can review, edit, and send it later from Outlook. The message
+    is NOT sent — use send_email for that. This is the recommended tool when a
+    workflow requires human review before delivery.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+            Example: "alice@example.com" or "alice@example.com; bob@example.com"
+        subject: The email subject line.
+        body: The plain-text body of the email. If html_body is also provided,
+            both are set and Outlook will prefer the HTML version.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+        html_body: Optional. HTML-formatted body. When provided, Outlook renders
+            the email as HTML. The plain-text body serves as fallback.
+        account: Optional. Account display name (or substring) to save under.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        A confirmation message with subject and recipients, or an error.
+    """
+    def _save(outlook, namespace, to, subject, body, cc, bcc, html_body, account):
+        store = _require_store(namespace, account)
+        mail = outlook.CreateItem(OL_MAIL_ITEM)
+        # Set the sending account so the draft is filed under the correct Drafts folder
+        for acc in outlook.Session.Accounts:
+            if acc.DeliveryStore.StoreID == store.StoreID:
+                mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
+                break
+        mail.To = to
+        mail.Subject = subject
+        mail.Body = body
+        if cc:
+            mail.CC = cc
+        if bcc:
+            mail.BCC = bcc
+        if html_body:
+            mail.HTMLBody = html_body
+        mail.Save()
+        return f"Draft saved: '{subject}' to {to}"
+
+    try:
+        return await bridge.call(_save, to, subject, body, cc, bcc, html_body, account)
+    except Exception as e:
+        return f"Error saving draft: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1C: list_drafts
+# =====================================================================
+
+@mcp.tool()
+async def list_drafts(
+    limit: int = 50,
+    offset: int = 0,
+    account: str = "",
+) -> str:
+    """List drafts currently saved in Outlook's Drafts folder.
+
+    Returns a JSON array of draft summaries sorted by last-modified time
+    (newest first). Each summary includes entry_id, subject, to, cc, bcc,
+    last_modified, has_attachments, and a short body_preview (first ~200
+    chars of the plain-text body). Use entry_id with read_draft to load the
+    full body or with send_draft to dispatch the message.
+
+    Args:
+        limit: Maximum number of drafts to return. Default 50, capped at 200.
+        offset: Number of newest drafts to skip before returning results.
+            Useful for pagination. Default 0.
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        JSON array of draft summary objects.
+    """
+    def _list(outlook, namespace, limit, offset, account):
+        limit = min(max(1, limit), 200)
+        offset = max(0, offset)
+        store = _require_store(namespace, account)
+        drafts = store.GetDefaultFolder(16)  # olFolderDrafts
+
+        items = drafts.Items
+        # Drafts use LastModificationTime rather than ReceivedTime
+        try:
+            items.Sort("[LastModificationTime]", True)
+        except Exception:
+            # Fallback: some stores reject sort on Drafts; iterate as-is
+            pass
+
+        total = items.Count
+        results = []
+        # Iterate sorted items, honoring offset and limit
+        # items.Item is 1-indexed
+        start = offset + 1
+        end = min(offset + limit, total)
+        for i in range(start, end + 1):
+            try:
+                item = items.Item(i)
+                body = item.Body or ""
+                preview = body[:200]
+                if len(body) > 200:
+                    preview += "..."
+                results.append({
+                    "entry_id": item.EntryID,
+                    "subject": item.Subject or "(no subject)",
+                    "to": item.To or "",
+                    "cc": item.CC or "",
+                    "bcc": item.BCC or "",
+                    "last_modified": str(item.LastModificationTime),
+                    "has_attachments": bool(item.Attachments.Count > 0),
+                    "attachment_count": item.Attachments.Count,
+                    "body_preview": preview,
+                })
+            except Exception:
+                continue
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, limit, offset, account)
+    except Exception as e:
+        return f"Error listing drafts: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1D: read_draft
+# =====================================================================
+
+@mcp.tool()
+async def read_draft(
+    draft_id: str,
+    account: str = "",
+) -> str:
+    """Read the full content of a specific draft.
+
+    Retrieves complete draft details including the full body, all recipients
+    (To/CC/BCC), attachment file names, and last-modified time. Use this to
+    review a draft before calling send_draft.
+
+    Args:
+        draft_id: The unique Outlook EntryID of the draft. Get this from
+            list_drafts results.
+        account: Optional. Account display name (or substring). Only needed
+            if draft_id is ambiguous across stores.
+
+    Returns:
+        JSON object with full draft details (entry_id, subject, to, cc, bcc,
+        body, html_body, attachments, last_modified, has_attachments).
+    """
+    def _read(outlook, namespace, draft_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(draft_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(draft_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+
+        attachments = []
+        try:
+            for i in range(item.Attachments.Count):
+                try:
+                    attachments.append(item.Attachments.Item(i + 1).FileName)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # HTMLBody may be very large; expose it but truncated like Body
+        html_body = ""
+        try:
+            html_body = item.HTMLBody or ""
+        except Exception:
+            html_body = ""
+
+        result = {
+            "entry_id": item.EntryID,
+            "subject": item.Subject or "(no subject)",
+            "to": item.To or "",
+            "cc": item.CC or "",
+            "bcc": item.BCC or "",
+            "body": item.Body or "",
+            "html_body": html_body,
+            "attachments": attachments,
+            "has_attachments": len(attachments) > 0,
+            "attachment_count": len(attachments),
+            "last_modified": str(item.LastModificationTime),
+        }
+        return json.dumps(result, indent=2, default=str)
+
+    try:
+        return await bridge.call(_read, draft_id, account)
+    except Exception as e:
+        return f"Error reading draft: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1E: send_draft
+# =====================================================================
+
+@mcp.tool()
+async def send_draft(
+    draft_id: str,
+    account: str = "",
+) -> str:
+    """Send an existing draft from Outlook's Drafts folder.
+
+    Looks up the draft by EntryID and calls MailItem.Send() on it. After a
+    successful send, Outlook automatically moves the message from Drafts to
+    Sent Items (this is standard Outlook behavior, not something this tool
+    does explicitly). The EntryID of the message changes when it moves
+    folders, so the returned message_id reflects the post-send location when
+    available.
+
+    Args:
+        draft_id: The unique Outlook EntryID of the draft to send. Get this
+            from list_drafts results.
+        account: Optional. Account display name (or substring). Only needed
+            if draft_id is ambiguous across stores.
+
+    Returns:
+        Confirmation message including the sent subject and recipients, or
+        an error.
+    """
+    def _send(outlook, namespace, draft_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(draft_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(draft_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+
+        subject = item.Subject or "(no subject)"
+        to = item.To or ""
+        # Send() triggers Outlook to deliver the message and (in standard
+        # Outlook behavior) move it to the Sent Items folder. The original
+        # EntryID is no longer valid afterward — Outlook assigns a new one.
+        item.Send()
+        return json.dumps({
+            "status": "sent",
+            "subject": subject,
+            "to": to,
+            "message": f"Draft sent: '{subject}' to {to}",
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_send, draft_id, account)
+    except Exception as e:
+        return f"Error sending draft: {format_com_error(e)}"
+
+
+# =====================================================================
 # TOOL 2: list_emails
 # =====================================================================
 
@@ -359,13 +665,13 @@ async def list_emails(
             restrictions.append("[UnRead] = True")
         if start_date:
             start = _parse_date(start_date)
-            restrictions.append(f"[ReceivedTime] >= '{start.strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] >= '{restrict_date(start)}'")
         if end_date:
             end = _parse_date(end_date)
-            restrictions.append(f"[ReceivedTime] <= '{end.strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] <= '{restrict_date(end)}'")
         elif start_date:
             # Default end to now when start is specified
-            restrictions.append(f"[ReceivedTime] <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] <= '{restrict_date(datetime.now())}'")
 
         if restrictions:
             items = items.Restrict(" AND ".join(restrictions))
@@ -749,16 +1055,16 @@ async def search_emails(
         if start_date:
             start = _parse_date(start_date)
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" >= '{start.strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" >= '{restrict_date(start, utc=True)}'"
             )
         if end_date:
             end = _parse_date(end_date)
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" <= '{restrict_date(end, utc=True)}'"
             )
         elif start_date:
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" <= '{restrict_date(datetime.now(), utc=True)}'"
             )
 
         filter_str = "@SQL=" + " AND ".join(dasl_parts)
@@ -802,6 +1108,7 @@ async def list_events(
     end_date: str = "",
     count: int = 20,
     account: str = "",
+    calendar: str = "",
 ) -> str:
     """List upcoming calendar events from Outlook.
 
@@ -820,15 +1127,28 @@ async def list_events(
         count: Maximum number of events to return. Default 20.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        calendar: Optional. Name or slash-delimited path of a specific
+            calendar folder to read, e.g. "Your family" or
+            "Kalender/Your family". Use list_calendars to discover available
+            calendar folders (including shared/synced ones). Default: the
+            account's default Calendar folder.
 
     Returns:
         JSON array of event summary objects.
     """
-    def _list(outlook, namespace, start_date, end_date, count, account):
+    def _list(outlook, namespace, start_date, end_date, count, account, calendar):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
-        calendar = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-        items = calendar.Items
+        if calendar:
+            cal_folder = _resolve_folder(namespace, calendar, store)
+            if cal_folder is None:
+                return (
+                    f"Error: Calendar folder '{calendar}' not found. "
+                    "Use list_calendars to see available calendar folders."
+                )
+        else:
+            cal_folder = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        items = cal_folder.Items
 
         # CRITICAL ORDER: Sort BEFORE IncludeRecurrences BEFORE Restrict
         items.Sort("[Start]")
@@ -838,8 +1158,8 @@ async def list_events(
         end = _parse_date(end_date) if end_date else start + timedelta(days=7)
 
         restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+            f"[Start] >= '{restrict_date(start)}' "
+            f"AND [Start] <= '{restrict_date(end)}'"
         )
         filtered = items.Restrict(restrict)
 
@@ -857,7 +1177,7 @@ async def list_events(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, start_date, end_date, count, account)
+        return await bridge.call(_list, start_date, end_date, count, account, calendar)
     except Exception as e:
         return f"Error listing events: {format_com_error(e)}"
 
@@ -910,6 +1230,7 @@ async def create_event(
     all_day: bool = False,
     reminder_minutes: int = 15,
     account: str = "",
+    calendar: str = "",
 ) -> str:
     """Create a personal calendar appointment (no attendees).
 
@@ -932,19 +1253,35 @@ async def create_event(
             Default 15. Set to 0 to disable reminder.
         account: Optional. Account display name (or substring) to create
             the event in. Default: primary account.
+        calendar: Optional. Name or slash-delimited path of a specific
+            calendar folder to create the event in, e.g. "Your family" or
+            "Kalender/Your family". Use list_calendars to discover available
+            calendar folders (including shared/synced ones). Default: the
+            account's default Calendar folder.
 
     Returns:
         Confirmation with event subject and entry_id, or an error.
     """
     def _create(outlook, namespace, subject, start, end, location, body,
-                all_day, reminder_minutes, account):
-        appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
-        # Move to correct store's calendar if account specified
-        if account:
+                all_day, reminder_minutes, account, calendar):
+        # Create directly inside the target calendar folder if one was
+        # requested. (Note: creating via outlook.CreateItem() and then
+        # calling .Move() on the unsaved item fails with a COM exception —
+        # Move only works on items that already exist in a folder.)
+        if account or calendar:
             store = _require_store(namespace, account)
-            cal = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-            appt.Move(cal)
-            appt = namespace.GetItemFromID(appt.EntryID)
+            if calendar:
+                cal = _resolve_folder(namespace, calendar, store)
+                if cal is None:
+                    return (
+                        f"Error: Calendar folder '{calendar}' not found. "
+                        "Use list_calendars to see available calendar folders."
+                    )
+            else:
+                cal = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+            appt = cal.Items.Add(OL_APPOINTMENT_ITEM)
+        else:
+            appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
         appt.Subject = subject
         appt.Start = start
         appt.End = end
@@ -965,15 +1302,78 @@ async def create_event(
             "start": str(appt.Start),
             "end": str(appt.End),
             "entry_id": appt.EntryID,
+            "calendar": calendar or "(default)",
         }, indent=2, default=str)
 
     try:
         return await bridge.call(
             _create, subject, start, end, location, body, all_day,
-            reminder_minutes, account,
+            reminder_minutes, account, calendar,
         )
     except Exception as e:
         return f"Error creating event: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL: list_calendars
+# =====================================================================
+
+@mcp.tool()
+async def list_calendars(account: str = "") -> str:
+    """List all calendar folders available in an account.
+
+    Includes the default Calendar plus any additional calendar folders —
+    e.g. a shared "Your family" calendar, or calendars synced in from
+    Google/other providers. Use the returned "full_path" (or a unique
+    "name") as the `calendar` argument to create_event to target a
+    specific calendar.
+
+    Args:
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        JSON array of calendar folder objects with name, full_path, and item_count.
+    """
+    def _list(outlook, namespace, account):
+        store = _require_store(namespace, account)
+        root = store.GetRootFolder()
+        results = []
+
+        def walk(f, path_prefix):
+            current_path = f"{path_prefix}/{f.Name}" if path_prefix else f.Name
+            try:
+                is_calendar = f.DefaultItemType == OL_APPOINTMENT_ITEM
+            except Exception:
+                is_calendar = False
+            if is_calendar:
+                try:
+                    item_count = f.Items.Count
+                except Exception:
+                    item_count = None
+                results.append({
+                    "name": f.Name,
+                    "full_path": current_path,
+                    "item_count": item_count,
+                })
+            for i in range(f.Folders.Count):
+                try:
+                    walk(f.Folders.Item(i + 1), current_path)
+                except Exception:
+                    continue
+
+        for i in range(root.Folders.Count):
+            try:
+                walk(root.Folders.Item(i + 1), "")
+            except Exception:
+                continue
+
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, account)
+    except Exception as e:
+        return f"Error listing calendars: {format_com_error(e)}"
 
 
 # =====================================================================
@@ -1244,6 +1644,7 @@ async def search_events(
     end_date: str = "",
     count: int = 10,
     account: str = "",
+    calendar: str = "",
 ) -> str:
     """Search for calendar events by keyword.
 
@@ -1259,15 +1660,28 @@ async def search_events(
         count: Maximum results to return. Default 10.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        calendar: Optional. Name or slash-delimited path of a specific
+            calendar folder to search, e.g. "Your family" or
+            "Kalender/Your family". Use list_calendars to discover available
+            calendar folders (including shared/synced ones). Default: the
+            account's default Calendar folder.
 
     Returns:
         JSON array of matching event summaries.
     """
-    def _search(outlook, namespace, query, start_date, end_date, count, account):
+    def _search(outlook, namespace, query, start_date, end_date, count, account, calendar):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
-        calendar = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-        items = calendar.Items
+        if calendar:
+            cal_folder = _resolve_folder(namespace, calendar, store)
+            if cal_folder is None:
+                return (
+                    f"Error: Calendar folder '{calendar}' not found. "
+                    "Use list_calendars to see available calendar folders."
+                )
+        else:
+            cal_folder = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        items = cal_folder.Items
         items.Sort("[Start]")
         items.IncludeRecurrences = True
 
@@ -1275,8 +1689,8 @@ async def search_events(
         end = _parse_date(end_date) if end_date else datetime.now() + timedelta(days=30)
 
         restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+            f"[Start] >= '{restrict_date(start)}' "
+            f"AND [Start] <= '{restrict_date(end)}'"
         )
         filtered = items.Restrict(restrict)
 
@@ -1294,7 +1708,7 @@ async def search_events(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_search, query, start_date, end_date, count, account)
+        return await bridge.call(_search, query, start_date, end_date, count, account, calendar)
     except Exception as e:
         return f"Error searching events: {format_com_error(e)}"
 
@@ -1402,13 +1816,16 @@ async def create_task(
     """
     def _create(outlook, namespace, subject, body, due_date, importance,
                 reminder_minutes, account):
-        task = outlook.CreateItem(OL_TASK_ITEM)
-        # Move to correct store's tasks folder if account specified
+        # Create directly inside the target store's tasks folder if one was
+        # requested. (Note: creating via outlook.CreateItem() and then
+        # calling .Move() on the unsaved item fails with a COM exception —
+        # Move only works on items that already exist in a folder.)
         if account:
             store = _require_store(namespace, account)
             tasks_folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
-            task.Move(tasks_folder)
-            task = namespace.GetItemFromID(task.EntryID)
+            task = tasks_folder.Items.Add(OL_TASK_ITEM)
+        else:
+            task = outlook.CreateItem(OL_TASK_ITEM)
         task.Subject = subject
         if body:
             task.Body = body
