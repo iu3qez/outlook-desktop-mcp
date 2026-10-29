@@ -44,6 +44,8 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_OPTIONAL,
     OL_TASK_ITEM,
     OL_TASK_COMPLETE,
+    OL_MARK_COMPLETE,
+    MARK_INTERVALS,
     TASK_STATUS_NAMES,
     IMPORTANCE_NAMES,
 )
@@ -55,6 +57,7 @@ from outlook_desktop_mcp.utils.formatting import (
     format_task_summary,
     format_task_full,
     format_todo_item,
+    outlook_date,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
 from outlook_desktop_mcp.utils.dates import restrict_date
@@ -2269,6 +2272,120 @@ async def list_todo(
         return await bridge.call(_list, include_completed, count, account)
     except Exception as e:
         return f"Error listing To-Do items: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def flag_email(
+    entry_id: str,
+    due: str = "today",
+    due_date: str = "",
+    flag_request: str = "",
+    reminder_time: str = "",
+    account: str = "",
+) -> str:
+    """Flag an email for follow-up so it appears in the To-Do List.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email.
+        due: Optional. Quick flag: "today" (default), "tomorrow",
+            "this_week", "next_week" or "no_date". Ignored if due_date is set.
+        due_date: Optional. Exact due date in ISO 8601 format (e.g.
+            "2026-03-01"). Overrides due.
+        flag_request: Optional. Flag text, e.g. "Call back". Outlook
+            default: "Follow up".
+        reminder_time: Optional. Reminder date/time in ISO 8601 format
+            (e.g. "2026-03-01 09:00").
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        JSON object with the flagged email's subject, due date and flag
+        text, or an error.
+    """
+    if not due_date and due.lower() not in MARK_INTERVALS:
+        return f"Error: Unknown due '{due}'. Use one of: {', '.join(MARK_INTERVALS)}."
+    try:
+        exact_due = _parse_date(due_date) if due_date else None
+        reminder = _parse_date(reminder_time) if reminder_time else None
+    except ValueError as e:
+        return f"Error: Invalid date: {e}"
+
+    def _flag(outlook, namespace, entry_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+        if exact_due is not None:
+            item.MarkAsTask(MARK_INTERVALS["no_date"])
+            # Outlook rejects a start date later than the due date
+            item.TaskStartDate = min(exact_due, datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0))
+            item.TaskDueDate = exact_due
+        else:
+            item.MarkAsTask(MARK_INTERVALS[due.lower()])
+        if flag_request:
+            item.FlagRequest = flag_request
+        if reminder is not None:
+            item.ReminderSet = True
+            item.ReminderTime = reminder
+        item.Save()
+        return json.dumps({
+            "status": "flagged",
+            "subject": item.Subject,
+            "flag_request": item.FlagRequest,
+            "due_date": outlook_date(item.TaskDueDate),
+            "reminder_time": str(item.ReminderTime) if item.ReminderSet else None,
+            "entry_id": item.EntryID,
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_flag, entry_id, account)
+    except Exception as e:
+        return f"Error flagging email: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def clear_flag(
+    entry_id: str,
+    mark_complete: bool = False,
+    account: str = "",
+) -> str:
+    """Remove an email's follow-up flag, or mark it complete.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email.
+        mark_complete: If true, mark the flag as completed (the email keeps a
+            check mark and shows as done in the To-Do List). Default false:
+            remove the flag entirely.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        Confirmation with the email subject.
+    """
+    def _clear(outlook, namespace, entry_id, mark_complete, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+        if mark_complete:
+            item.MarkAsTask(OL_MARK_COMPLETE)
+        else:
+            item.ClearTaskFlag()
+        item.Save()
+        action = "marked complete" if mark_complete else "cleared"
+        return f"Flag {action}: '{item.Subject}'"
+
+    try:
+        return await bridge.call(_clear, entry_id, mark_complete, account)
+    except Exception as e:
+        return f"Error clearing flag: {format_com_error(e)}"
 
 
 # =====================================================================
