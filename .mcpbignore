@@ -1,0 +1,14 @@
+.git/
+.github/
+.venv/
+.claude/
+CLAUDE.md
+__pycache__/
+*.py[cod]
+dist/
+build/
+docs/
+tests/
+scripts/
+outlook-desktop-mcp.cmd
+uv.lock

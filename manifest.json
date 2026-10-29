@@ -1,0 +1,216 @@
+{
+  "manifest_version": "0.4",
+  "name": "outlook-desktop-mcp",
+  "display_name": "Outlook Desktop",
+  "version": "0.3.2",
+  "description": "Email, calendar, tasks and To-Do in your local Outlook — no Graph API, no app registration.",
+  "long_description": "Drives the Outlook Desktop app already signed in on this computer: Classic Outlook on Windows through COM, Outlook for Mac through AppleScript. Outlook must be running. The new Outlook (olk.exe) is not supported.",
+  "author": {
+    "name": "Andreas Martin Aanerud"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/iu3qez/outlook-desktop-mcp"
+  },
+  "license": "AGPL-3.0",
+  "keywords": [
+    "mcp",
+    "outlook",
+    "email",
+    "com",
+    "applescript",
+    "automation",
+    "windows",
+    "macos",
+    "microsoft",
+    "claude"
+  ],
+  "server": {
+    "type": "uv",
+    "entry_point": "src/mcpb_server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${__dirname}",
+        "src/mcpb_server.py"
+      ]
+    }
+  },
+  "tools": [
+    {
+      "name": "list_accounts",
+      "description": "List all Outlook accounts (stores) configured in the profile."
+    },
+    {
+      "name": "send_email",
+      "description": "Send an email using the user's Outlook account."
+    },
+    {
+      "name": "save_draft",
+      "description": "Save an email as a draft in Outlook's Drafts folder without sending."
+    },
+    {
+      "name": "list_drafts",
+      "description": "List drafts currently saved in Outlook's Drafts folder."
+    },
+    {
+      "name": "read_draft",
+      "description": "Read the full content of a specific draft."
+    },
+    {
+      "name": "send_draft",
+      "description": "Send an existing draft from Outlook's Drafts folder."
+    },
+    {
+      "name": "list_emails",
+      "description": "List recent emails from a specified Outlook folder."
+    },
+    {
+      "name": "read_email",
+      "description": "Read the full content of a specific email."
+    },
+    {
+      "name": "mark_as_read",
+      "description": "Mark a specific email as read in Outlook."
+    },
+    {
+      "name": "mark_as_unread",
+      "description": "Mark a specific email as unread in Outlook."
+    },
+    {
+      "name": "move_email",
+      "description": "Move an email to a different Outlook folder."
+    },
+    {
+      "name": "move_by_filter",
+      "description": "Move every item in a folder that matches a DASL filter, in bulk."
+    },
+    {
+      "name": "reply_email",
+      "description": "Reply to an email in Outlook."
+    },
+    {
+      "name": "list_folders",
+      "description": "List mail folders in the user's Outlook mailbox."
+    },
+    {
+      "name": "search_emails",
+      "description": "Search for emails in Outlook using text, sender and/or a raw DASL filter."
+    },
+    {
+      "name": "list_events",
+      "description": "List upcoming calendar events from Outlook."
+    },
+    {
+      "name": "get_event",
+      "description": "Read the full details of a specific calendar event."
+    },
+    {
+      "name": "create_event",
+      "description": "Create a personal calendar appointment (no attendees)."
+    },
+    {
+      "name": "list_calendars",
+      "description": "List all calendar folders available in an account."
+    },
+    {
+      "name": "create_meeting",
+      "description": "Create a meeting and send invitations to attendees."
+    },
+    {
+      "name": "update_event",
+      "description": "Update an existing calendar event."
+    },
+    {
+      "name": "delete_event",
+      "description": "Delete a calendar event or cancel a meeting."
+    },
+    {
+      "name": "respond_to_meeting",
+      "description": "Respond to a meeting invitation (accept, decline, or tentative)."
+    },
+    {
+      "name": "search_events",
+      "description": "Search for calendar events by keyword."
+    },
+    {
+      "name": "list_tasks",
+      "description": "List tasks from the Outlook Tasks folder or one of its task lists."
+    },
+    {
+      "name": "get_task",
+      "description": "Read the full details of a specific task."
+    },
+    {
+      "name": "create_task",
+      "description": "Create a new task in Outlook."
+    },
+    {
+      "name": "update_task",
+      "description": "Update an existing task."
+    },
+    {
+      "name": "complete_task",
+      "description": "Mark a task as complete."
+    },
+    {
+      "name": "delete_task",
+      "description": "Delete a task from Outlook."
+    },
+    {
+      "name": "list_todo",
+      "description": "List the Outlook To-Do List: tasks plus emails and contacts flagged for follow-up, sorted by due date (undated items last)."
+    },
+    {
+      "name": "flag_email",
+      "description": "Flag an email for follow-up so it appears in the To-Do List."
+    },
+    {
+      "name": "clear_flag",
+      "description": "Remove an email's follow-up flag, or mark it complete."
+    },
+    {
+      "name": "list_attachments",
+      "description": "List all attachments on an email or calendar event."
+    },
+    {
+      "name": "save_attachment",
+      "description": "Save an attachment from an email or event to disk."
+    },
+    {
+      "name": "list_categories",
+      "description": "List all available Outlook categories."
+    },
+    {
+      "name": "set_category",
+      "description": "Set categories on an email, event, or task."
+    },
+    {
+      "name": "list_rules",
+      "description": "List all mail rules in Outlook."
+    },
+    {
+      "name": "toggle_rule",
+      "description": "Enable or disable a mail rule by name."
+    },
+    {
+      "name": "create_rule",
+      "description": "Create a new incoming-mail rule."
+    },
+    {
+      "name": "get_out_of_office",
+      "description": "Check the current Out of Office (auto-reply) status."
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "win32",
+      "darwin"
+    ],
+    "runtimes": {
+      "python": ">=3.12"
+    }
+  }
+}
