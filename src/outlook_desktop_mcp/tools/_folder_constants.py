@@ -8,6 +8,8 @@ OL_FOLDER_CALENDAR = 9
 OL_FOLDER_TASKS = 13
 OL_FOLDER_JUNK = 23
 OL_FOLDER_OUTBOX = 4
+# To-Do List: tasks plus flagged emails and contacts (virtual folder)
+OL_FOLDER_TODO = 28
 
 FOLDER_NAME_TO_ENUM = {
     "inbox": OL_FOLDER_INBOX,
@@ -89,3 +91,9 @@ IMPORTANCE_NAMES = {0: "low", 1: "normal", 2: "high"}
 OL_RULE_ACTION_MOVE = 1
 OL_RULE_ACTION_DELETE = 8
 OL_RULE_ACTION_MARK_READ = 11
+
+# OlMarkInterval (MailItem.MarkAsTask)
+OL_MARK_COMPLETE = 5
+MARK_INTERVALS = {
+    "today": 0, "tomorrow": 1, "this_week": 2, "next_week": 3, "no_date": 4,
+}

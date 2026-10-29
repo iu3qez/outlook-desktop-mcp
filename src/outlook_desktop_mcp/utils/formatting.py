@@ -83,6 +83,15 @@ def format_event_full(item, body_max_length: int = 5000) -> dict:
 # --- Task formatting ---
 
 
+def outlook_date(value) -> str | None:
+    """Stringify an Outlook date, mapping the "no date" sentinel (1/1/4501)
+    to None. Checked by year because str() of a pywintypes datetime is
+    ISO-like, not the M/D/YYYY form Outlook shows."""
+    if value is None or getattr(value, "year", 4501) >= 4501:
+        return None
+    return str(value)
+
+
 def format_task_summary(item) -> dict:
     """Extract key fields from an Outlook TaskItem."""
     return {
@@ -90,8 +99,8 @@ def format_task_summary(item) -> dict:
         "subject": item.Subject or "(no subject)",
         "status": TASK_STATUS_NAMES.get(item.Status, "unknown"),
         "percent_complete": item.PercentComplete,
-        "due_date": str(item.DueDate) if str(item.DueDate) != "01/01/4501" else None,
-        "start_date": str(item.StartDate) if str(item.StartDate) != "01/01/4501" else None,
+        "due_date": outlook_date(item.DueDate),
+        "start_date": outlook_date(item.StartDate),
         "importance": IMPORTANCE_NAMES.get(item.Importance, "normal"),
         "complete": bool(item.Complete),
         "categories": item.Categories or "",
@@ -107,4 +116,36 @@ def format_task_full(item, body_max_length: int = 5000) -> dict:
     result["date_completed"] = (
         str(item.DateCompleted) if item.Complete else None
     )
+    return result
+
+
+# --- To-Do formatting ---
+
+# olObjectClass values of the item kinds that show up in the To-Do List
+_TODO_ITEM_TYPES = {48: "task", 43: "email", 40: "contact"}
+_OL_CLASS_TASK = 48
+
+
+def format_todo_item(item) -> dict:
+    """Common view of a To-Do List entry: a TaskItem, or an email/contact
+    flagged for follow-up (whose dates live in the Task* properties)."""
+    item_class = item.Class
+    is_task = item_class == _OL_CLASS_TASK
+    result = {
+        "entry_id": item.EntryID,
+        "item_type": _TODO_ITEM_TYPES.get(item_class, "other"),
+        "subject": item.Subject or "(no subject)",
+        "due_date": outlook_date(item.DueDate if is_task else item.TaskDueDate),
+        "start_date": outlook_date(item.StartDate if is_task else item.TaskStartDate),
+        "importance": IMPORTANCE_NAMES.get(item.Importance, "normal"),
+        "categories": item.Categories or "",
+    }
+    if is_task:
+        result["complete"] = bool(item.Complete)
+        result["status"] = TASK_STATUS_NAMES.get(item.Status, "unknown")
+    else:
+        result["complete"] = outlook_date(item.TaskCompletedDate) is not None
+        result["flag_request"] = getattr(item, "FlagRequest", "") or ""
+        if item_class == 43:
+            result["sender_name"] = getattr(item, "SenderName", "") or ""
     return result

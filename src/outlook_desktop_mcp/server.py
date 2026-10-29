@@ -34,6 +34,7 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
     OL_FOLDER_TASKS,
+    OL_FOLDER_TODO,
     OL_MEETING,
     OL_MEETING_CANCELED,
     OL_RESPONSE_TENTATIVE,
@@ -43,6 +44,8 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_OPTIONAL,
     OL_TASK_ITEM,
     OL_TASK_COMPLETE,
+    OL_MARK_COMPLETE,
+    MARK_INTERVALS,
     TASK_STATUS_NAMES,
     IMPORTANCE_NAMES,
 )
@@ -53,6 +56,8 @@ from outlook_desktop_mcp.utils.formatting import (
     format_event_full,
     format_task_summary,
     format_task_full,
+    format_todo_item,
+    outlook_date,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
 from outlook_desktop_mcp.utils.dates import restrict_date
@@ -121,7 +126,10 @@ mcp = FastMCP(
         "- Email: send, list, read, search, reply, mark read/unread, move, attachments\n"
         "- Calendar: list events, create appointments/meetings, update, delete, "
         "respond to invites, search events\n"
-        "- Tasks: create, list, complete, update, delete to-do items\n"
+        "- Tasks: create, list, complete, update, delete tasks, also in "
+        "Microsoft To Do lists (subfolders of Tasks)\n"
+        "- To-Do: list the To-Do List (tasks plus flagged emails), flag "
+        "emails for follow-up, clear or complete flags\n"
         "- Categories: list and set color categories on any item\n"
         "- Rules: list, create and enable/disable mail rules\n"
         "- Out of Office: check auto-reply status\n"
@@ -258,6 +266,51 @@ def _resolve_folder(namespace, folder_name: str, store=None):
         pass
 
     return None
+
+
+def _resolve_task_folder(namespace, store, folder: str = ""):
+    """Resolve a task list to its MAPIFolder, or None if not found.
+
+    Empty means the default Tasks folder. Otherwise the name (or
+    slash-delimited path) is looked up first among the subfolders of Tasks —
+    where Microsoft To Do lists live on Exchange/M365 accounts — then
+    anywhere in the store. Only folders holding task items are accepted.
+    """
+    tasks = store.GetDefaultFolder(OL_FOLDER_TASKS)
+    folder = folder.strip().strip("/")
+    if not folder:
+        return tasks
+
+    current = tasks
+    for part in folder.split("/"):
+        part_lower = part.strip().lower()
+        found = None
+        try:
+            for i in range(current.Folders.Count):
+                f = current.Folders.Item(i + 1)
+                if f.Name.lower() == part_lower:
+                    found = f
+                    break
+        except Exception:
+            found = None
+        if found is None:
+            current = None
+            break
+        current = found
+    if current is not None:
+        return current
+
+    found = _resolve_folder(namespace, folder, store)
+    if found is not None and found.DefaultItemType == OL_TASK_ITEM:
+        return found
+    return None
+
+
+def _task_folder_not_found(folder: str) -> str:
+    return (
+        f"Error: Task list '{folder}' not found. Use list_folders(folder='tasks') "
+        "to see the available task lists."
+    )
 
 
 # =====================================================================
@@ -1241,6 +1294,10 @@ def _parse_date(date_str: str) -> datetime:
     return datetime.fromisoformat(date_str)
 
 
+# Outlook's "no date" value: assigning it clears a date field.
+_OL_NO_DATE = datetime(4501, 1, 1)
+
+
 # =====================================================================
 # TOOL 10: list_events
 # =====================================================================
@@ -1864,29 +1921,37 @@ async def search_events(
 async def list_tasks(
     include_completed: bool = False,
     count: int = 20,
+    folder: str = "",
     account: str = "",
 ) -> str:
-    """List tasks from the Outlook Tasks folder.
+    """List tasks from the Outlook Tasks folder or one of its task lists.
 
     Returns a JSON array of task summaries sorted by due date. Each task
     includes entry_id, subject, status, percent_complete, due_date,
     importance, and categories.
 
+    Only task items are listed: flagged emails appear in list_todo instead.
+
     Args:
         include_completed: If true, include completed tasks. Default false
             (only pending/in-progress tasks).
         count: Maximum number of tasks to return. Default 20.
+        folder: Optional. Task list to read, e.g. a Microsoft To Do list
+            synced as a subfolder of Tasks ("Groceries") or a path
+            ("Tasks/Work"). Default: the main Tasks folder.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
         JSON array of task summary objects.
     """
-    def _list(outlook, namespace, include_completed, count, account):
+    def _list(outlook, namespace, include_completed, count, folder, account):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
-        folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
-        items = folder.Items
+        task_folder = _resolve_task_folder(namespace, store, folder)
+        if task_folder is None:
+            return _task_folder_not_found(folder)
+        items = task_folder.Items
         items.Sort("[DueDate]")
 
         if not include_completed:
@@ -1902,7 +1967,7 @@ async def list_tasks(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, include_completed, count, account)
+        return await bridge.call(_list, include_completed, count, folder, account)
     except Exception as e:
         return f"Error listing tasks: {format_com_error(e)}"
 
@@ -1940,6 +2005,7 @@ async def create_task(
     due_date: str = "",
     importance: str = "normal",
     reminder_minutes: int = 0,
+    folder: str = "",
     account: str = "",
 ) -> str:
     """Create a new task in Outlook.
@@ -1951,6 +2017,9 @@ async def create_task(
         importance: Optional. "low", "normal" (default), or "high".
         reminder_minutes: Optional. Minutes before due date to remind.
             Default 0 (no reminder).
+        folder: Optional. Task list to create the task in, e.g. a
+            Microsoft To Do list synced as a subfolder of Tasks. Default:
+            the main Tasks folder.
         account: Optional. Account display name (or substring) to create
             the task in. Default: primary account.
 
@@ -1958,14 +2027,16 @@ async def create_task(
         Confirmation with task subject and entry_id.
     """
     def _create(outlook, namespace, subject, body, due_date, importance,
-                reminder_minutes, account):
+                reminder_minutes, folder, account):
         # Create directly inside the target store's tasks folder if one was
         # requested. (Note: creating via outlook.CreateItem() and then
         # calling .Move() on the unsaved item fails with a COM exception —
         # Move only works on items that already exist in a folder.)
-        if account:
+        if account or folder:
             store = _require_store(namespace, account)
-            tasks_folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
+            tasks_folder = _resolve_task_folder(namespace, store, folder)
+            if tasks_folder is None:
+                return _task_folder_not_found(folder)
             task = tasks_folder.Items.Add(OL_TASK_ITEM)
         else:
             task = outlook.CreateItem(OL_TASK_ITEM)
@@ -1992,10 +2063,109 @@ async def create_task(
     try:
         return await bridge.call(
             _create, subject, body, due_date, importance, reminder_minutes,
-            account,
+            folder, account,
         )
     except Exception as e:
         return f"Error creating task: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def update_task(
+    entry_id: str,
+    subject: str = "",
+    body: str = "",
+    due_date: str = "",
+    start_date: str = "",
+    status: str = "",
+    percent_complete: int = -1,
+    importance: str = "",
+    reminder_time: str = "",
+    account: str = "",
+) -> str:
+    """Update an existing task.
+
+    Only the fields you provide are changed — omitted fields stay as they are.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the task.
+        subject: Optional. New task title.
+        body: Optional. New task description or notes.
+        due_date: Optional. New due date in ISO 8601 format (e.g.
+            "2026-03-01"), or "none" to remove it.
+        start_date: Optional. New start date in ISO 8601 format, or "none"
+            to remove it.
+        status: Optional. "not_started", "in_progress", "complete",
+            "waiting" or "deferred".
+        percent_complete: Optional. 0-100. Default -1 (unchanged).
+        importance: Optional. "low", "normal" or "high".
+        reminder_time: Optional. Reminder date/time in ISO 8601 format
+            (e.g. "2026-03-01 09:00"), or "none" to turn the reminder off.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        JSON object with the updated task summary, or an error.
+    """
+    status_codes = {name: code for code, name in TASK_STATUS_NAMES.items()}
+    importance_codes = {name: code for code, name in IMPORTANCE_NAMES.items()}
+
+    if status and status.lower() not in status_codes:
+        return f"Error: Unknown status '{status}'. Use one of: {', '.join(status_codes)}."
+    if importance and importance.lower() not in importance_codes:
+        return f"Error: Unknown importance '{importance}'. Use low, normal or high."
+    if percent_complete != -1 and not 0 <= percent_complete <= 100:
+        return "Error: percent_complete must be between 0 and 100."
+
+    def _date(value):
+        return _OL_NO_DATE if value.strip().lower() == "none" else _parse_date(value)
+
+    try:
+        due = _date(due_date) if due_date else None
+        start = _date(start_date) if start_date else None
+        reminder = (
+            _parse_date(reminder_time)
+            if reminder_time and reminder_time.strip().lower() != "none" else None
+        )
+    except ValueError as e:
+        return f"Error: Invalid date: {e}"
+
+    def _update(outlook, namespace, entry_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
+            return err
+        if subject:
+            item.Subject = subject
+        if body:
+            item.Body = body
+        if start is not None:
+            item.StartDate = start
+        if due is not None:
+            item.DueDate = due
+        if status:
+            item.Status = status_codes[status.lower()]
+        if percent_complete != -1:
+            item.PercentComplete = percent_complete
+        if importance:
+            item.Importance = importance_codes[importance.lower()]
+        if reminder is not None:
+            item.ReminderSet = True
+            item.ReminderTime = reminder
+        elif reminder_time:
+            item.ReminderSet = False
+        item.Save()
+        return json.dumps(
+            {"status": "updated", **format_task_summary(item)},
+            indent=2, default=str,
+        )
+
+    try:
+        return await bridge.call(_update, entry_id, account)
+    except Exception as e:
+        return f"Error updating task: {format_com_error(e)}"
 
 
 @mcp.tool()
@@ -2059,6 +2229,166 @@ async def delete_task(entry_id: str, account: str = "") -> str:
         return await bridge.call(_delete, entry_id, account)
     except Exception as e:
         return f"Error deleting task: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def list_todo(
+    include_completed: bool = False,
+    count: int = 50,
+    account: str = "",
+) -> str:
+    """List the Outlook To-Do List: tasks plus emails and contacts flagged
+    for follow-up, sorted by due date (undated items last).
+
+    Each entry has entry_id, item_type ("task", "email" or "contact"),
+    subject, due_date, start_date, complete, importance and categories.
+    Flagged emails also carry flag_request and sender_name. Use the task
+    tools on "task" entries and flag_email / clear_flag on "email" entries.
+
+    Args:
+        include_completed: If true, include completed items. Default false.
+        count: Maximum number of entries to return. Default 50, max 200.
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account.
+
+    Returns:
+        JSON array of To-Do entries.
+    """
+    def _list(outlook, namespace, include_completed, count, account):
+        count = min(max(1, count), 200)
+        store = _require_store(namespace, account)
+        items = store.GetDefaultFolder(OL_FOLDER_TODO).Items
+        entries = []
+        # Mixed item types share no sortable property, so sort in Python;
+        # the scan is capped to keep huge stores responsive.
+        for i in range(min(items.Count, 2000)):
+            try:
+                entry = format_todo_item(items.Item(i + 1))
+            except Exception:
+                continue
+            if include_completed or not entry["complete"]:
+                entries.append(entry)
+        entries.sort(key=lambda e: (e["due_date"] is None, e["due_date"] or ""))
+        return json.dumps(entries[:count], indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, include_completed, count, account)
+    except Exception as e:
+        return f"Error listing To-Do items: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def flag_email(
+    entry_id: str,
+    due: str = "today",
+    due_date: str = "",
+    flag_request: str = "",
+    reminder_time: str = "",
+    account: str = "",
+) -> str:
+    """Flag an email for follow-up so it appears in the To-Do List.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email.
+        due: Optional. Quick flag: "today" (default), "tomorrow",
+            "this_week", "next_week" or "no_date". Ignored if due_date is set.
+        due_date: Optional. Exact due date in ISO 8601 format (e.g.
+            "2026-03-01"). Overrides due.
+        flag_request: Optional. Flag text, e.g. "Call back". Outlook
+            default: "Follow up".
+        reminder_time: Optional. Reminder date/time in ISO 8601 format
+            (e.g. "2026-03-01 09:00").
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        JSON object with the flagged email's subject, due date and flag
+        text, or an error.
+    """
+    if not due_date and due.lower() not in MARK_INTERVALS:
+        return f"Error: Unknown due '{due}'. Use one of: {', '.join(MARK_INTERVALS)}."
+    try:
+        exact_due = _parse_date(due_date) if due_date else None
+        reminder = _parse_date(reminder_time) if reminder_time else None
+    except ValueError as e:
+        return f"Error: Invalid date: {e}"
+
+    def _flag(outlook, namespace, entry_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+        if exact_due is not None:
+            item.MarkAsTask(MARK_INTERVALS["no_date"])
+            # Outlook rejects a start date later than the due date
+            item.TaskStartDate = min(exact_due, datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0))
+            item.TaskDueDate = exact_due
+        else:
+            item.MarkAsTask(MARK_INTERVALS[due.lower()])
+        if flag_request:
+            item.FlagRequest = flag_request
+        if reminder is not None:
+            item.ReminderSet = True
+            item.ReminderTime = reminder
+        item.Save()
+        return json.dumps({
+            "status": "flagged",
+            "subject": item.Subject,
+            "flag_request": item.FlagRequest,
+            "due_date": outlook_date(item.TaskDueDate),
+            "reminder_time": str(item.ReminderTime) if item.ReminderSet else None,
+            "entry_id": item.EntryID,
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_flag, entry_id, account)
+    except Exception as e:
+        return f"Error flagging email: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def clear_flag(
+    entry_id: str,
+    mark_complete: bool = False,
+    account: str = "",
+) -> str:
+    """Remove an email's follow-up flag, or mark it complete.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email.
+        mark_complete: If true, mark the flag as completed (the email keeps a
+            check mark and shows as done in the To-Do List). Default false:
+            remove the flag entirely.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        Confirmation with the email subject.
+    """
+    def _clear(outlook, namespace, entry_id, mark_complete, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+        if mark_complete:
+            item.MarkAsTask(OL_MARK_COMPLETE)
+        else:
+            item.ClearTaskFlag()
+        item.Save()
+        action = "marked complete" if mark_complete else "cleared"
+        return f"Flag {action}: '{item.Subject}'"
+
+    try:
+        return await bridge.call(_clear, entry_id, mark_complete, account)
+    except Exception as e:
+        return f"Error clearing flag: {format_com_error(e)}"
 
 
 # =====================================================================
