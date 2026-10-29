@@ -34,6 +34,7 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
     OL_FOLDER_TASKS,
+    OL_FOLDER_TODO,
     OL_MEETING,
     OL_MEETING_CANCELED,
     OL_RESPONSE_TENTATIVE,
@@ -53,6 +54,7 @@ from outlook_desktop_mcp.utils.formatting import (
     format_event_full,
     format_task_summary,
     format_task_full,
+    format_todo_item,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
 from outlook_desktop_mcp.utils.dates import restrict_date
@@ -2221,6 +2223,52 @@ async def delete_task(entry_id: str, account: str = "") -> str:
         return await bridge.call(_delete, entry_id, account)
     except Exception as e:
         return f"Error deleting task: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def list_todo(
+    include_completed: bool = False,
+    count: int = 50,
+    account: str = "",
+) -> str:
+    """List the Outlook To-Do List: tasks plus emails and contacts flagged
+    for follow-up, sorted by due date (undated items last).
+
+    Each entry has entry_id, item_type ("task", "email" or "contact"),
+    subject, due_date, start_date, complete, importance and categories.
+    Flagged emails also carry flag_request and sender_name. Use the task
+    tools on "task" entries and flag_email / clear_flag on "email" entries.
+
+    Args:
+        include_completed: If true, include completed items. Default false.
+        count: Maximum number of entries to return. Default 50, max 200.
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account.
+
+    Returns:
+        JSON array of To-Do entries.
+    """
+    def _list(outlook, namespace, include_completed, count, account):
+        count = min(max(1, count), 200)
+        store = _require_store(namespace, account)
+        items = store.GetDefaultFolder(OL_FOLDER_TODO).Items
+        entries = []
+        # Mixed item types share no sortable property, so sort in Python;
+        # the scan is capped to keep huge stores responsive.
+        for i in range(min(items.Count, 2000)):
+            try:
+                entry = format_todo_item(items.Item(i + 1))
+            except Exception:
+                continue
+            if include_completed or not entry["complete"]:
+                entries.append(entry)
+        entries.sort(key=lambda e: (e["due_date"] is None, e["due_date"] or ""))
+        return json.dumps(entries[:count], indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, include_completed, count, account)
+    except Exception as e:
+        return f"Error listing To-Do items: {format_com_error(e)}"
 
 
 # =====================================================================

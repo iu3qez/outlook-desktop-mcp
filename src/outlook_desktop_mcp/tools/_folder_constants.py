@@ -8,6 +8,8 @@ OL_FOLDER_CALENDAR = 9
 OL_FOLDER_TASKS = 13
 OL_FOLDER_JUNK = 23
 OL_FOLDER_OUTBOX = 4
+# To-Do List: tasks plus flagged emails and contacts (virtual folder)
+OL_FOLDER_TODO = 28
 
 FOLDER_NAME_TO_ENUM = {
     "inbox": OL_FOLDER_INBOX,
