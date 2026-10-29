@@ -260,6 +260,51 @@ def _resolve_folder(namespace, folder_name: str, store=None):
     return None
 
 
+def _resolve_task_folder(namespace, store, folder: str = ""):
+    """Resolve a task list to its MAPIFolder, or None if not found.
+
+    Empty means the default Tasks folder. Otherwise the name (or
+    slash-delimited path) is looked up first among the subfolders of Tasks —
+    where Microsoft To Do lists live on Exchange/M365 accounts — then
+    anywhere in the store. Only folders holding task items are accepted.
+    """
+    tasks = store.GetDefaultFolder(OL_FOLDER_TASKS)
+    folder = folder.strip().strip("/")
+    if not folder:
+        return tasks
+
+    current = tasks
+    for part in folder.split("/"):
+        part_lower = part.strip().lower()
+        found = None
+        try:
+            for i in range(current.Folders.Count):
+                f = current.Folders.Item(i + 1)
+                if f.Name.lower() == part_lower:
+                    found = f
+                    break
+        except Exception:
+            found = None
+        if found is None:
+            current = None
+            break
+        current = found
+    if current is not None:
+        return current
+
+    found = _resolve_folder(namespace, folder, store)
+    if found is not None and found.DefaultItemType == OL_TASK_ITEM:
+        return found
+    return None
+
+
+def _task_folder_not_found(folder: str) -> str:
+    return (
+        f"Error: Task list '{folder}' not found. Use list_folders(folder='tasks') "
+        "to see the available task lists."
+    )
+
+
 # =====================================================================
 # TOOL: list_accounts
 # =====================================================================
@@ -1864,29 +1909,37 @@ async def search_events(
 async def list_tasks(
     include_completed: bool = False,
     count: int = 20,
+    folder: str = "",
     account: str = "",
 ) -> str:
-    """List tasks from the Outlook Tasks folder.
+    """List tasks from the Outlook Tasks folder or one of its task lists.
 
     Returns a JSON array of task summaries sorted by due date. Each task
     includes entry_id, subject, status, percent_complete, due_date,
     importance, and categories.
 
+    Only task items are listed: flagged emails appear in list_todo instead.
+
     Args:
         include_completed: If true, include completed tasks. Default false
             (only pending/in-progress tasks).
         count: Maximum number of tasks to return. Default 20.
+        folder: Optional. Task list to read, e.g. a Microsoft To Do list
+            synced as a subfolder of Tasks ("Groceries") or a path
+            ("Tasks/Work"). Default: the main Tasks folder.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
         JSON array of task summary objects.
     """
-    def _list(outlook, namespace, include_completed, count, account):
+    def _list(outlook, namespace, include_completed, count, folder, account):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
-        folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
-        items = folder.Items
+        task_folder = _resolve_task_folder(namespace, store, folder)
+        if task_folder is None:
+            return _task_folder_not_found(folder)
+        items = task_folder.Items
         items.Sort("[DueDate]")
 
         if not include_completed:
@@ -1902,7 +1955,7 @@ async def list_tasks(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, include_completed, count, account)
+        return await bridge.call(_list, include_completed, count, folder, account)
     except Exception as e:
         return f"Error listing tasks: {format_com_error(e)}"
 
@@ -1940,6 +1993,7 @@ async def create_task(
     due_date: str = "",
     importance: str = "normal",
     reminder_minutes: int = 0,
+    folder: str = "",
     account: str = "",
 ) -> str:
     """Create a new task in Outlook.
@@ -1951,6 +2005,9 @@ async def create_task(
         importance: Optional. "low", "normal" (default), or "high".
         reminder_minutes: Optional. Minutes before due date to remind.
             Default 0 (no reminder).
+        folder: Optional. Task list to create the task in, e.g. a
+            Microsoft To Do list synced as a subfolder of Tasks. Default:
+            the main Tasks folder.
         account: Optional. Account display name (or substring) to create
             the task in. Default: primary account.
 
@@ -1958,14 +2015,16 @@ async def create_task(
         Confirmation with task subject and entry_id.
     """
     def _create(outlook, namespace, subject, body, due_date, importance,
-                reminder_minutes, account):
+                reminder_minutes, folder, account):
         # Create directly inside the target store's tasks folder if one was
         # requested. (Note: creating via outlook.CreateItem() and then
         # calling .Move() on the unsaved item fails with a COM exception —
         # Move only works on items that already exist in a folder.)
-        if account:
+        if account or folder:
             store = _require_store(namespace, account)
-            tasks_folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
+            tasks_folder = _resolve_task_folder(namespace, store, folder)
+            if tasks_folder is None:
+                return _task_folder_not_found(folder)
             task = tasks_folder.Items.Add(OL_TASK_ITEM)
         else:
             task = outlook.CreateItem(OL_TASK_ITEM)
@@ -1992,7 +2051,7 @@ async def create_task(
     try:
         return await bridge.call(
             _create, subject, body, due_date, importance, reminder_minutes,
-            account,
+            folder, account,
         )
     except Exception as e:
         return f"Error creating task: {format_com_error(e)}"
