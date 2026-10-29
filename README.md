@@ -146,11 +146,15 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
-| `list_tasks` | yes | yes | List pending or completed tasks, sorted by due date |
+| `list_tasks` | yes | yes | List pending or completed tasks, sorted by due date; on Windows also from a Microsoft To Do list via `folder` |
 | `get_task` | yes | yes | Read full task details including body and completion status |
-| `create_task` | yes | yes | Create a new task with subject, due date, importance |
+| `create_task` | yes | yes | Create a new task with subject, due date, importance; on Windows also in a To Do list via `folder` |
+| `update_task` | yes | — | Change a task's subject, body, dates, status, progress, importance or reminder |
 | `complete_task` | yes | yes | Mark a task as complete |
 | `delete_task` | yes | yes | Remove a task |
+| `list_todo` | yes | — | List the To-Do List: tasks plus flagged emails and contacts, sorted by due date |
+| `flag_email` | yes | — | Flag an email for follow-up (today, tomorrow, this/next week, or an exact date) |
+| `clear_flag` | yes | — | Remove an email's flag or mark it complete |
 
 ### Attachments
 
@@ -172,7 +176,7 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `create_rule` | yes | — | Create an incoming-mail rule (sender/subject/body conditions; move, copy, categorize, delete) |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 37 tools on Windows, 27 tools on macOS.**
+**Total: 41 tools on Windows, 27 tools on macOS.**
 
 ## Architecture Details
 
@@ -281,6 +285,7 @@ Once registered, just talk to Claude naturally:
 - *"Create a meeting with bob@example.com tomorrow at 2pm for 30 minutes"*
 - *"Save the attachment from that email to my Downloads folder"*
 - *"Create a task to review the quarterly report, due Friday, high importance"*
+- *"What's on my To-Do list this week? Flag the invoice email from Alice for tomorrow"*
 - *"Mark that email as read and move it to archive"*
 
 Windows-only examples:
