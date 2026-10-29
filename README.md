@@ -24,6 +24,16 @@ claude mcp add outlook-desktop -- outlook-desktop-mcp
 
 **3. Open Outlook and start a Claude Code session.** That's it — tools are available immediately.
 
+### Claude Desktop extension
+
+Build the one-click extension bundle (needs Python 3.11+ and Node.js):
+
+```bash
+python scripts/build_mcpb.py
+```
+
+This regenerates `manifest.json` (version from `pyproject.toml`, tool list from `server.py`) and writes `dist/outlook-desktop-mcp-<version>.mcpb`. Open that file in Claude Desktop (or drag it into **Settings → Extensions**) to install it. The bundle carries only the source and installs its dependencies from `pyproject.toml` with `uv` on first start. If Claude Desktop reports that `uv` is missing, install it (`winget install astral-sh.uv` on Windows, `brew install uv` on macOS) and restart Claude Desktop.
+
 ## How It Works — Platform Routing
 
 When the server starts, it checks which operating system it is running on and takes one of two paths:
