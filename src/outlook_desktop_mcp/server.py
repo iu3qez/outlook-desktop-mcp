@@ -1286,6 +1286,10 @@ def _parse_date(date_str: str) -> datetime:
     return datetime.fromisoformat(date_str)
 
 
+# Outlook's "no date" value: assigning it clears a date field.
+_OL_NO_DATE = datetime(4501, 1, 1)
+
+
 # =====================================================================
 # TOOL 10: list_events
 # =====================================================================
@@ -2055,6 +2059,105 @@ async def create_task(
         )
     except Exception as e:
         return f"Error creating task: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def update_task(
+    entry_id: str,
+    subject: str = "",
+    body: str = "",
+    due_date: str = "",
+    start_date: str = "",
+    status: str = "",
+    percent_complete: int = -1,
+    importance: str = "",
+    reminder_time: str = "",
+    account: str = "",
+) -> str:
+    """Update an existing task.
+
+    Only the fields you provide are changed — omitted fields stay as they are.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the task.
+        subject: Optional. New task title.
+        body: Optional. New task description or notes.
+        due_date: Optional. New due date in ISO 8601 format (e.g.
+            "2026-03-01"), or "none" to remove it.
+        start_date: Optional. New start date in ISO 8601 format, or "none"
+            to remove it.
+        status: Optional. "not_started", "in_progress", "complete",
+            "waiting" or "deferred".
+        percent_complete: Optional. 0-100. Default -1 (unchanged).
+        importance: Optional. "low", "normal" or "high".
+        reminder_time: Optional. Reminder date/time in ISO 8601 format
+            (e.g. "2026-03-01 09:00"), or "none" to turn the reminder off.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        JSON object with the updated task summary, or an error.
+    """
+    status_codes = {name: code for code, name in TASK_STATUS_NAMES.items()}
+    importance_codes = {name: code for code, name in IMPORTANCE_NAMES.items()}
+
+    if status and status.lower() not in status_codes:
+        return f"Error: Unknown status '{status}'. Use one of: {', '.join(status_codes)}."
+    if importance and importance.lower() not in importance_codes:
+        return f"Error: Unknown importance '{importance}'. Use low, normal or high."
+    if percent_complete != -1 and not 0 <= percent_complete <= 100:
+        return "Error: percent_complete must be between 0 and 100."
+
+    def _date(value):
+        return _OL_NO_DATE if value.strip().lower() == "none" else _parse_date(value)
+
+    try:
+        due = _date(due_date) if due_date else None
+        start = _date(start_date) if start_date else None
+        reminder = (
+            _parse_date(reminder_time)
+            if reminder_time and reminder_time.strip().lower() != "none" else None
+        )
+    except ValueError as e:
+        return f"Error: Invalid date: {e}"
+
+    def _update(outlook, namespace, entry_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
+            return err
+        if subject:
+            item.Subject = subject
+        if body:
+            item.Body = body
+        if start is not None:
+            item.StartDate = start
+        if due is not None:
+            item.DueDate = due
+        if status:
+            item.Status = status_codes[status.lower()]
+        if percent_complete != -1:
+            item.PercentComplete = percent_complete
+        if importance:
+            item.Importance = importance_codes[importance.lower()]
+        if reminder is not None:
+            item.ReminderSet = True
+            item.ReminderTime = reminder
+        elif reminder_time:
+            item.ReminderSet = False
+        item.Save()
+        return json.dumps(
+            {"status": "updated", **format_task_summary(item)},
+            indent=2, default=str,
+        )
+
+    try:
+        return await bridge.call(_update, entry_id, account)
+    except Exception as e:
+        return f"Error updating task: {format_com_error(e)}"
 
 
 @mcp.tool()
