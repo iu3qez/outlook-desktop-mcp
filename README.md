@@ -120,11 +120,12 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `send_draft` | yes | yes | Send an existing draft by ID (moves to Sent Items automatically) |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
-| `search_emails` | yes | yes | Full-text search across email subjects and bodies |
+| `search_emails` | yes | yes | Full-text search across email subjects and bodies; on Windows also by `sender` or a raw DASL `filter` |
 | `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread |
 | `mark_as_read` | yes | yes | Mark a specific email as read |
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |
 | `move_email` | yes | yes | Move an email to Archive, Trash, or any folder |
+| `move_by_filter` | yes | — | Bulk-move every message matching a DASL filter (dry run by default) |
 | `list_folders` | yes | yes | Browse the folder hierarchy with item counts |
 
 ### Calendar
@@ -139,6 +140,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `delete_event` | yes | yes | Delete an appointment or cancel a meeting |
 | `respond_to_meeting` | yes | — | Accept, decline, or tentatively accept a meeting invite |
 | `search_events` | yes | yes | Search calendar events by keyword within a date range |
+| `list_calendars` | yes | — | List calendar folders (including shared calendars) for targeting |
 
 ### Tasks
 
@@ -167,9 +169,10 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `set_category` | yes | — | Set or clear categories on any email, event, or task |
 | `list_rules` | yes | — | List all mail rules with enabled/disabled status |
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
+| `create_rule` | yes | — | Create an incoming-mail rule (sender/subject/body conditions; move, copy, categorize, delete) |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 33 tools on Windows, 26 tools on macOS.**
+**Total: 37 tools on Windows, 27 tools on macOS.**
 
 ## Architecture Details
 
